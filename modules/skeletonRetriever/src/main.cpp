@@ -24,6 +24,9 @@
 #include <yarp/os/all.h>
 #include <yarp/dev/PolyDriver.h>
 #include <yarp/dev/IRGBDSensor.h>
+#include <yarp/dev/IFrameTransform.h>
+#include <yarp/dev/IVisualParams.h>
+#include <yarp/dev/GenericVocabs.h>
 #include <yarp/sig/all.h>
 #include <yarp/math/Math.h>
 #include <iCub/ctrl/filters.h>
@@ -57,7 +60,7 @@ class MetaSkeleton
     unordered_map<string,unsigned int> limbs_length_cnt;
     bool optimize_limblength;
     CamParamsHelper camParams;
-    
+
     /****************************************************************/
     vector<pair<string,pair<Vector,Vector>>> optimize_limbs(const vector<string> &tags)
     {
@@ -96,7 +99,7 @@ public:
 
     /****************************************************************/
     MetaSkeleton(const CamParamsHelper &camParams_, const double t, const int filter_keypoint_order_,
-                 const int filter_limblength_order_, const bool optimize_limblength_) : 
+                 const int filter_limblength_order_, const bool optimize_limblength_) :
                  camParams(camParams_), timer(t), opc_id(opc_id_invalid),
                  optimize_limblength(optimize_limblength_), name_confidence(0.0)
     {
@@ -230,14 +233,14 @@ class Retriever : public RFModule
     BufferedPort<Bottle> skeletonsPort;
     BufferedPort<ImageOf<PixelFloat>> depthPort;
     BufferedPort<Bottle> viewerPort;
-    BufferedPort<Property> navPort;
-    BufferedPort<Property> gazePort;
     RpcClient opcPort;
 
     PolyDriver rgbdDrv;
+    yarp::dev::PolyDriver tcpolydriver;
+    yarp::dev::IFrameTransform* iTf = nullptr;
 
-    Matrix navFrame, gazeFrame, rootFrame;
-    bool navFrameUpdated, gazeFrameUpdated;
+    string rootFrameName;
+    Matrix rootFrame;
 
     ImageOf<PixelFloat> depth;
 
@@ -302,7 +305,7 @@ class Retriever : public RFModule
                 return true;
             }
         }
-        
+
         return false;
     }
 
@@ -545,6 +548,26 @@ class Retriever : public RFModule
     }
 
     /****************************************************************/
+    bool tfUpdate(const shared_ptr<MetaSkeleton> &s, string skeleton_frame_name, const Stamp &stamp)
+    {
+        if (iTf)
+        {
+            auto keypoints = s->skeleton->get_unordered();
+            for (auto it = keypoints.begin(); it!= keypoints.end(); it++)
+            {
+                yarp::sig::Matrix m(4,4);
+                m.eye();
+                m[0][3] = it->second[0];
+                m[1][3] = it->second[1];
+                m[2][3] = it->second[2];
+                iTf->setTransform(rootFrameName, skeleton_frame_name + "/"+ it->first, m);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /****************************************************************/
     bool opcSet(const shared_ptr<MetaSkeleton> &s, const Stamp &stamp)
     {
         if (opcPort.getOutputCount())
@@ -668,68 +691,13 @@ class Retriever : public RFModule
     }
 
     /****************************************************************/
-    bool update_nav_frame()
-    {
-        if (Property *p=navPort.read(false))
-        {
-            if (Bottle *b=p->find("robot-location").asList())
-            {
-                if (b->size()>=3)
-                {
-                    Vector rot(4,0.0);
-                    rot[2]=1.0; rot[3]=(M_PI/180.0)*b->get(2).asFloat64();
-                    navFrame=axis2dcm(rot);
-                    navFrame(0,3)=b->get(0).asFloat64();
-                    navFrame(1,3)=b->get(1).asFloat64();
-                    navFrameUpdated=true;
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /****************************************************************/
-    bool update_gaze_frame()
-    {
-        if (Property* p=gazePort.read(false))
-        {
-            if (Bottle* b=p->find("depth_rgb").asList())
-            {
-                if (b->size()>=7)
-                {
-                    Vector pos(3);
-                    for (size_t i=0; i<pos.length(); i++)
-                    {
-                        pos[i]=b->get(i).asFloat64();
-                    }
-
-                    Vector ax(4);
-                    for (size_t i=0; i<ax.length(); i++)
-                    {
-                        ax[i]=b->get(pos.length()+i).asFloat64();
-                    }
-
-                    gazeFrame=axis2dcm(ax);
-                    gazeFrame.setSubcol(pos,0,3);
-                    gazeFrameUpdated=true;
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /****************************************************************/
     shared_ptr<SkeletonStd> applyTransform(shared_ptr<SkeletonStd> &s)
     {
-        if (navFrameUpdated && gazeFrameUpdated)
+        if (1)
         {
             shared_ptr<SkeletonStd> sk=shared_ptr<SkeletonStd>(new SkeletonStd());
             sk->fromProperty(s->toProperty());
-            sk->setTransformation(rootFrame);
+            sk->setTransformation(rootFrame); //@@@This needs to be checked
             sk->update();
             return sk;
         }
@@ -897,11 +865,38 @@ class Retriever : public RFModule
         skeletonsPort.open("/skeletonRetriever/skeletons:i");
         depthPort.open("/skeletonRetriever/depth:i");
         viewerPort.open("/skeletonRetriever/viewer:o");
-        navPort.open("/skeletonRetriever/nav:i");
-        gazePort.open("/skeletonRetriever/gaze:i");
         opcPort.open("/skeletonRetriever/opc:rpc");
 
-        navFrame=gazeFrame=eye(4,4);
+        Bottle &tc_cfg = rf.findGroup("transformClient");
+        rootFrameName = tc_cfg.find("rootFrameName").asString();
+        string tcClientLocalName = "/skeletonRetriever/TfClient";
+
+        if (tc_cfg.isNull())
+        {
+            yError() << "Missing transformClient group";
+            return false;
+        }
+        else
+        {
+            Property options;
+            options.put("device", "transformClient");
+            options.put("local", tcClientLocalName);
+            options.put("remote", "/transformServer");
+            tcpolydriver.open(options);
+            if (tcpolydriver.isValid() == false)
+            {
+                yError() << "Unable to open transform client polydriver";
+                return false;
+            }
+            tcpolydriver.view(iTf);
+            if (iTf == nullptr)
+            {
+                yError() << "Unable to open transform client interface";
+                return false;
+            }
+        }
+
+        rootFrame=eye(4,4);
 
         t0=Time::now();
         return true;
@@ -948,11 +943,6 @@ class Retriever : public RFModule
         // garbage collector
         gc(dt);
 
-        // update external frames
-        update_nav_frame();
-        update_gaze_frame();
-        rootFrame=navFrame*gazeFrame;
-
         // handle skeletons acquired from detector
         if (Bottle *b1=skeletonsPort.read(false))
         {
@@ -983,8 +973,10 @@ class Retriever : public RFModule
 
                     vector<string> viewer_remove_tags;
                     vector<shared_ptr<MetaSkeleton>> pending=skeletons;
+                    int counter = 0;
                     for (auto &n:new_accepted_skeletons)
                     {
+                        string skeleton_frame_prefix = "/human" + std::to_string(counter);
                         vector<double> scores=computeScores(pending,n);
                         auto it=min_element(scores.begin(),scores.end());
                         if (it!=scores.end())
@@ -995,6 +987,7 @@ class Retriever : public RFModule
                                 auto &s=pending[i];
                                 update(n,s,viewer_remove_tags);
                                 opcSet(s,stamp);
+                                tfUpdate(s, skeleton_frame_prefix, stamp);
                                 pending.erase(pending.begin()+i);
                                 continue;
                             }
@@ -1002,6 +995,7 @@ class Retriever : public RFModule
 
                         if (opcAdd(n,stamp))
                         {
+                            tfUpdate(n, skeleton_frame_prefix, stamp);
                             skeletons.push_back(n);
                         }
                     }
@@ -1029,9 +1023,8 @@ class Retriever : public RFModule
         skeletonsPort.close();
         depthPort.close();
         viewerPort.close();
-        navPort.close();
-        gazePort.close();
         opcPort.close();
+        if (tcpolydriver.isValid()) { tcpolydriver.close(); }
 
         return true;
     }
@@ -1064,4 +1057,3 @@ int main(int argc, char *argv[])
     Retriever retriever;
     return retriever.runModule(rf);
 }
-
