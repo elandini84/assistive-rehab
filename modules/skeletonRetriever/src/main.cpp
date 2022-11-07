@@ -870,33 +870,45 @@ class Retriever : public RFModule
         viewerPort.open("/skeletonRetriever/viewer:o");
         opcPort.open("/skeletonRetriever/opc:rpc");
 
-        Bottle &tc_cfg = rf.findGroup("transformClient");
-        rootFrameName = tc_cfg.find("rootFrameName").asString();
-        string tcClientLocalName = "/skeletonRetriever/TfClient";
 
-        if (tc_cfg.isNull())
+        yarp::os::Property tcProp;
+        // Prepare default prop object
+        tcProp.put("device", "frameTransformClient");
+        tcProp.put("ft_client_prefix", "/skeletonRetriever/TfClient");
+        tcProp.put("local_rpc", "/skeletonRetriever/TfClient/ftClient.rpc");
+        tcProp.put("filexml_option","ftc_ros.xml");
+        bool okTransformRf = rf.check("transformClient");
+        if(!okTransformRf)
         {
-            yError() << "Missing transformClient group";
+            yError("transformClient section missing in ini file. Closing the device");
             return false;
         }
-        else
+        yarp::os::Searchable &tf_config = rf.findGroup("transformClient");
+        if(!tf_config.check("rootFrameName")) {
+            yError("transformClient rootFrameName option missing in ini file. Closing the device");
+            return false;
+        }
+        rootFrameName = tf_config.find("rootFrameName").asString();
+
+        if (tf_config.check("ft_client_prefix")) {
+            tcProp.put("ft_client_prefix", tf_config.find("ft_client_prefix").asString());
+        }
+        if (tf_config.check("ft_server_prefix")) {
+            tcProp.put("ft_server_prefix", tf_config.find("ft_server_prefix").asString());
+        }
+        if(tf_config.check("filexml_option")) {tcProp.put("filexml_option", tf_config.find("filexml_option").asString());}
+
+        tcpolydriver.open(tcProp);
+        if(!tcpolydriver.isValid())
         {
-            Property options;
-            options.put("device", "transformClient");
-            options.put("local", tcClientLocalName);
-            options.put("remote", "/transformServer");
-            tcpolydriver.open(options);
-            if (tcpolydriver.isValid() == false)
-            {
-                yError() << "Unable to open transform client polydriver";
-                return false;
-            }
-            tcpolydriver.view(iTf);
-            if (iTf == nullptr)
-            {
-                yError() << "Unable to open transform client interface";
-                return false;
-            }
+            yError("Error opening PolyDriver check parameters");
+            return false;
+        }
+        tcpolydriver.view(iTf);
+        if(!iTf)
+        {
+            yError("Error opening iFrameTransform interface. Device not available");
+            return false;
         }
 
         rootFrame=eye(4,4);
@@ -983,7 +995,7 @@ class Retriever : public RFModule
                         string skeleton_frame_prefix = "/human" + std::to_string(counter++);
                         vector<double> scores=computeScores(pending,n);
                         auto it=min_element(scores.begin(),scores.end());
-                        
+
                         yDebug() << "scores size: " << scores.size();
 
                         if (it!=scores.end())
@@ -1039,8 +1051,7 @@ class Retriever : public RFModule
 public:
 
     /****************************************************************/
-    Retriever() : camera_configured(false), navFrameUpdated(false),
-        gazeFrameUpdated(false) { }
+    Retriever() : camera_configured(false) { }
 
 };
 
